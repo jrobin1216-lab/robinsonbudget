@@ -1,6 +1,6 @@
 // Keeps the app shell (this page and its icons) on the phone so the app opens instantly.
 // Your financial data is never cached here: it always loads live from the dashboard.
-var CACHE = 'finances-shell-v1';
+var CACHE = 'finances-shell-v2';
 var SHELL = ['./', 'index.html', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', function (e) {
