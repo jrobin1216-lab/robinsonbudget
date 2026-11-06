@@ -16,26 +16,56 @@
   html, body { margin: 0; height: 100%; background: #0a0a0b; color: #e7e7ea; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
   iframe { position: fixed; inset: 0; width: 100%; height: 100%; border: 0; background: #0a0a0b;
            padding-top: env(safe-area-inset-top); box-sizing: border-box; }
-  .splash { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; transition: opacity .3s; }
-  .splash img { width: 72px; height: 72px; border-radius: 18px; }
-  .splash p { margin: 0; color: #8c8c93; }
+  .splash, .lock { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px; transition: opacity .3s; background: #0a0a0b; padding: 24px; box-sizing: border-box; text-align: center; }
+  .splash img, .lock img { width: 72px; height: 72px; border-radius: 18px; }
+  .splash p, .lock p { margin: 0; color: #8c8c93; max-width: 300px; }
   .splash.gone { opacity: 0; pointer-events: none; }
   .offline { display: none; max-width: 300px; text-align: center; }
-  .offline button { margin-top: 12px; background: #8b7cf6; color: #fff; border: 0; border-radius: 10px; padding: 10px 18px; font: inherit; }
+  button { font: inherit; cursor: pointer; }
+  .pri { background: #8b7cf6; color: #fff; border: 0; border-radius: 12px; padding: 12px 22px; font-weight: 500; }
+  .link { background: none; border: 0; color: #8c8c93; text-decoration: underline; padding: 8px; font-size: 13px; }
+  .offline button { margin-top: 12px; }
+  .lock { z-index: 10; display: none; }
+  .lock.on { display: flex; }
+  .lock h1 { margin: 0; font-size: 20px; font-weight: 500; }
+  .lock .err { color: #fbbf24; min-height: 20px; }
+  .ask { position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); z-index: 5; background: #18181c; border: 1px solid #2a2a30; border-radius: 16px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.5); display: none; }
+  .ask.on { display: block; }
+  .ask b { display: block; margin-bottom: 4px; font-weight: 500; }
+  .ask p { margin: 0 0 12px; color: #8c8c93; }
+  .ask .row { display: flex; gap: 8px; justify-content: flex-end; }
+  .ask .row .link { text-decoration: none; }
 </style>
 </head>
 <body>
 <div class="splash" id="splash">
   <img src="icon-192.png" alt="">
   <p id="status">Loading your finances…</p>
-  <div class="offline" id="offline">You're offline. Connect to the internet to see your dashboard.<br><button type="button" onclick="location.reload()">Try again</button></div>
+  <div class="offline" id="offline">You're offline. Connect to the internet to see your dashboard.<br><button type="button" class="pri" onclick="location.reload()">Try again</button></div>
 </div>
 <iframe id="app" title="Robinson Finances" allow="clipboard-write"
   src="https://script.google.com/macros/s/AKfycbykwvHDzjpNuF0-rgWNFh68_MHahwGbyQM_bdogVTxNzvaRpDKTBsyS789BNBoWTb5n/exec"></iframe>
+
+<div class="lock" id="lock" role="dialog" aria-label="Locked">
+  <img src="icon-192.png" alt="">
+  <h1>Robinson Finances is locked</h1>
+  <button type="button" class="pri" id="unlockBtn">Unlock with Face ID</button>
+  <p class="err" id="lockMsg"></p>
+  <button type="button" class="link" id="pwInstead">Use my password instead</button>
+  <button type="button" class="link" id="lockOff">Turn off the Face ID lock</button>
+</div>
+
+<div class="ask" id="ask" role="dialog" aria-label="Face ID">
+  <b>Lock the app with Face ID?</b>
+  <p>The app asks for Face ID (or your fingerprint) when you open it, and after it's been in the background for 5 minutes.</p>
+  <div class="row"><button type="button" class="link" id="askNo">Not now</button><button type="button" class="pri" id="askYes">Turn on</button></div>
+</div>
+
 <script>
   var splash = document.getElementById('splash'), frame = document.getElementById('app');
   frame.style.visibility = 'hidden';
-  function show() { frame.style.visibility = ''; splash.classList.add('gone'); }
+  var shown = false;
+  function show() { if (shown) return; shown = true; if (!Lock.locked) frame.style.visibility = ''; splash.classList.add('gone'); Lock.maybeAsk(); }
   if (!navigator.onLine) {
     document.getElementById('status').hidden = true;
     document.getElementById('offline').style.display = 'block';
@@ -44,6 +74,106 @@
     setTimeout(show, 8000);  // never leave the splash up if the load event is slow
   }
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(function () { /* app still works without it */ });
+
+  /* ---------- Face ID lock (installed app only) ----------
+     A passkey made on this phone, used only to unlock this screen. Nothing about it is sent anywhere,
+     and the dashboard still has its own sign-in behind it. */
+  var Lock = (function () {
+    var KEY = 'fd-lock-cred', HID = 'fd-lock-hidden', NO = 'fd-lock-declined', AWAY = 5 * 60 * 1000;
+    var $ = function (id) { return document.getElementById(id); };
+    var store = {
+      get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+      set: function (k, v) { try { if (v == null) localStorage.removeItem(k); else localStorage.setItem(k, v); } catch (e) { /* private mode */ } }
+    };
+    var installed = function () { return navigator.standalone === true || (window.matchMedia && matchMedia('(display-mode: standalone)').matches); };
+    var supported = function () { return !!(window.PublicKeyCredential && navigator.credentials && navigator.credentials.create); };
+    var b64 = function (buf) { return btoa(String.fromCharCode.apply(null, new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+    var unb64 = function (s) { s = s.replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; return Uint8Array.from(atob(s), function (c) { return c.charCodeAt(0); }); };
+    var rand = function (n) { var a = new Uint8Array(n); crypto.getRandomValues(a); return a; };
+    var enrolled = function () { return !!store.get(KEY); };
+    var busy = false;
+
+    var api = { locked: false };
+    function lock() {
+      api.locked = true; frame.style.visibility = 'hidden';
+      $('lock').classList.add('on'); $('ask').classList.remove('on'); $('lockMsg').textContent = '';
+    }
+    function unlock() {
+      api.locked = false; $('lock').classList.remove('on');
+      if (shown) frame.style.visibility = '';
+    }
+    // Ask the authenticator to check the face/finger. Resolves true only for this phone's passkey with the person verified.
+    function verify() {
+      var id = store.get(KEY); if (!id) return Promise.resolve(false);
+      return navigator.credentials.get({ publicKey: {
+        challenge: rand(32), allowCredentials: [{ type: 'public-key', id: unb64(id), transports: ['internal', 'hybrid'] }],
+        userVerification: 'required', timeout: 60000 } })
+        .then(function (c) {
+          if (!c || b64(c.rawId) !== id) return false;
+          var flags = new Uint8Array(c.response.authenticatorData)[32];
+          return (flags & 0x04) === 0x04;   // "user verified" bit: Face ID or fingerprint, not just a tap
+        });
+    }
+    function tryUnlock(fromButton) {
+      if (busy) return; busy = true; $('lockMsg').textContent = '';
+      verify().then(function (ok) {
+        if (ok) unlock(); else $('lockMsg').textContent = 'That didn\'t work. Try again.';
+      }).catch(function (e) {
+        // iPhone sometimes needs a tap before it will show Face ID; the button is there for that.
+        $('lockMsg').textContent = fromButton ? (e && e.name === 'NotAllowedError' ? 'Face ID was cancelled. Try again.' : 'Face ID isn\'t available right now.') : '';
+      }).then(function () { busy = false; });
+    }
+    // Walk the dashboard's frames and ask it to sign out (it only listens to this site).
+    function signOutDashboard() {
+      (function post(w, depth) {
+        try { w.postMessage({ type: 'fd-signout' }, '*'); } catch (e) { /* ignore */ }
+        if (depth > 3) return;
+        try { for (var i = 0; i < w.frames.length; i++) post(w.frames[i], depth + 1); } catch (e) { /* ignore */ }
+      })(frame.contentWindow, 0);
+    }
+
+    api.maybeAsk = function () {
+      if (!installed() || !supported() || enrolled() || api.locked) return;
+      var no = +store.get(NO) || 0; if (Date.now() - no < 30 * 864e5) return;
+      PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(function (ok) { if (ok && !enrolled()) setTimeout(function () { $('ask').classList.add('on'); }, 1500); }).catch(function () { /* no Face ID */ });
+    };
+    $('askNo').onclick = function () { store.set(NO, String(Date.now())); $('ask').classList.remove('on'); };
+    $('askYes').onclick = function () {
+      $('askYes').disabled = true;
+      navigator.credentials.create({ publicKey: {
+        challenge: rand(32), rp: { name: 'Robinson Finances' },
+        user: { id: rand(16), name: 'Finances app on this phone', displayName: 'Robinson Finances app' },
+        pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+        authenticatorSelection: { authenticatorAttachment: 'platform', userVerification: 'required', residentKey: 'discouraged' },
+        attestation: 'none', timeout: 60000 } })
+        .then(function (c) { store.set(KEY, b64(c.rawId)); store.set(NO, null); $('ask').classList.remove('on'); })
+        .catch(function () { $('ask').querySelector('p').textContent = 'Face ID wasn\'t set up. You can try again, or choose Not now.'; })
+        .then(function () { $('askYes').disabled = false; });
+    };
+    $('unlockBtn').onclick = function () { tryUnlock(true); };
+    $('lockOff').onclick = function () {
+      // Turning it off needs Face ID first, so someone holding the phone can't just switch it off.
+      verify().then(function (ok) { if (!ok) throw new Error('no'); store.set(KEY, null); store.set(NO, String(Date.now())); unlock(); })
+        .catch(function () { $('lockMsg').textContent = 'Turning it off needs Face ID. Or use your password instead.'; });
+    };
+    $('pwInstead').onclick = function () {
+      // Skipping Face ID signs the dashboard out, so getting in still takes the password.
+      signOutDashboard(); store.set(KEY, null); store.set(NO, null);   // offers Face ID again once signed in
+      $('lockMsg').textContent = 'Signing out…';
+      setTimeout(function () { location.reload(); }, 900);
+    };
+
+    document.addEventListener('visibilitychange', function () {
+      if (!enrolled()) return;
+      if (document.visibilityState === 'hidden') { if (!api.locked) store.set(HID, String(Date.now())); return; }
+      var at = +store.get(HID) || 0;
+      if (!api.locked && at && Date.now() - at >= AWAY) { lock(); tryUnlock(false); }
+      if (!api.locked) store.set(HID, null);
+    });
+    // Opening the app fresh always asks.
+    if (installed() && supported() && enrolled()) { lock(); tryUnlock(false); }
+    return api;
+  })();
 </script>
 </body>
 </html>
